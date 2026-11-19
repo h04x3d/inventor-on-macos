@@ -70,7 +70,9 @@ See [wine-patches.md](wine-patches.md) for the details. In short:
    unpainted border, like any Windows app with a custom frame. On macOS the top
    strip landed under the menu bar as a white line; the edge pixels are now
    extended over it, and macOS no longer fights the app's placement.
-4. **App name** – the menu bar, Dock and app switcher show the program's name
+4. **Native file dialogs** – Open/Save/folder dialogs are the real macOS
+   panels (sheet on the window, Format popup), not Wine's XP-style dialog.
+5. **App name** – the menu bar, Dock and app switcher show the program's name
    (`AppName` setting, default: the `.exe` name) instead of "wine".
 
 ### Installer survival

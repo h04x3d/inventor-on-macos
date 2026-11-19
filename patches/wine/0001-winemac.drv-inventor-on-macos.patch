@@ -1,8 +1,15 @@
 diff --git a/dlls/winemac.drv/Makefile.in b/dlls/winemac.drv/Makefile.in
-index 1eb2b9c..811974e 100644
+index 1eb2b9c..985b1cb 100644
 --- a/dlls/winemac.drv/Makefile.in
 +++ b/dlls/winemac.drv/Makefile.in
-@@ -28,6 +28,7 @@ SOURCES = \
+@@ -22,12 +22,14 @@ SOURCES = \
+ 	cocoa_cursorclipping.m \
+ 	cocoa_display.m \
+ 	cocoa_event.m \
++	cocoa_filepanel.m \
+ 	cocoa_main.m \
+ 	cocoa_opengl.m \
+ 	cocoa_status_item.m \
  	cocoa_window.m \
  	display.c \
  	dllmain.c \
@@ -10,6 +17,12 @@ index 1eb2b9c..811974e 100644
  	event.c \
  	gdi.c \
  	image.c \
+@@ -40,4 +42,5 @@ SOURCES = \
+ 	systray.c \
+ 	vulkan.c \
+ 	window.c \
++	winemac.drv.spec \
+ 	winemac.rc
 diff --git a/dlls/winemac.drv/cocoa_app.m b/dlls/winemac.drv/cocoa_app.m
 index 0e3cbb5..41b9a7b 100644
 --- a/dlls/winemac.drv/cocoa_app.m
@@ -60,6 +73,161 @@ index 0e3cbb5..41b9a7b 100644
  
              if ([bundleName length])
                  title = [NSString stringWithFormat:WineLocalizedString(STRING_MENU_ITEM_HIDE_APPNAME), bundleName];
+diff --git a/b/dlls/winemac.drv/cocoa_filepanel.m b/dlls/winemac.drv/cocoa_filepanel.m
+new file mode 100644
+index 0000000..b526cac
+--- /dev/null
++++ b/dlls/winemac.drv/cocoa_filepanel.m
+@@ -0,0 +1,149 @@
++/*
++ * Native NSOpenPanel / NSSavePanel for Wine's file dialogs.
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ */
++#import <AppKit/AppKit.h>
++#include "macdrv_cocoa.h"
++#import "cocoa_app.h"
++#import "cocoa_window.h"
++
++/* filters: lines "name\tspec\n"; spec like "*.ipt;*.iam" */
++static NSArray<NSString*>* extensions_for_spec(NSString* spec)
++{
++    NSMutableArray* exts = [NSMutableArray array];
++    for (NSString* part in [spec componentsSeparatedByString:@";"])
++    {
++        NSString* p = [part stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
++        if ([p isEqualToString:@"*"] || [p isEqualToString:@"*.*"]) return nil;   /* everything */
++        if ([p hasPrefix:@"*."]) p = [p substringFromIndex:2];
++        if ([p length] && [p rangeOfCharacterFromSet:[NSCharacterSet characterSetWithCharactersInString:@"*?"]].location == NSNotFound)
++            [exts addObject:p];
++    }
++    return [exts count] ? exts : nil;
++}
++
++@interface WineFilePanelFilter : NSObject
++@property (assign) NSSavePanel* panel;
++@property (retain) NSArray* specs;
++- (void) filterChanged:(NSPopUpButton*)sender;
++@end
++
++@implementation WineFilePanelFilter
++- (void) apply:(NSInteger)index
++{
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wdeprecated-declarations"
++    if (index >= 0 && index < (NSInteger)[self.specs count])
++        self.panel.allowedFileTypes = extensions_for_spec(self.specs[index]);
++    else
++        self.panel.allowedFileTypes = nil;
++#pragma clang diagnostic pop
++}
++- (void) filterChanged:(NSPopUpButton*)sender { [self apply:[sender indexOfSelectedItem]]; }
++- (void) dealloc { [_specs release]; [super dealloc]; }
++@end
++
++int macdrv_run_file_panel(WineWindow* owner, int mode, int multi, const char* title, const char* ok_label,
++                          const char* dir, const char* name, const char* filters, int* filter_index,
++                          char* out, int out_size)
++{
++    __block int ret = 0;
++    __block NSString* result = nil;
++    dispatch_semaphore_t done = dispatch_semaphore_create(0);
++
++    OnMainThreadAsync(^{
++        NSSavePanel* panel;
++        NSOpenPanel* open = nil;
++        WineFilePanelFilter* filter = nil;
++        NSPopUpButton* popup = nil;
++        NSMutableArray* names = [NSMutableArray array];
++        NSMutableArray* specs = [NSMutableArray array];
++
++        if (mode == 1) panel = [NSSavePanel savePanel];
++        else panel = open = [NSOpenPanel openPanel];
++
++        if (open)
++        {
++            open.canChooseFiles = (mode != 2);
++            open.canChooseDirectories = (mode == 2);
++            open.allowsMultipleSelection = multi && mode != 2;
++            open.resolvesAliases = YES;
++        }
++        panel.canCreateDirectories = YES;
++        panel.showsHiddenFiles = NO;
++        if (title && *title)
++        {
++            panel.title = @(title);
++            if (mode == 2) panel.message = @(title);   /* folder pickers pass an instruction text */
++        }
++        if (ok_label && *ok_label) panel.prompt = [@(ok_label) stringByReplacingOccurrencesOfString:@"&" withString:@""];
++        if (dir && *dir) panel.directoryURL = [NSURL fileURLWithPath:@(dir) isDirectory:YES];
++
++        if (mode != 2 && filters && *filters)
++        {
++            for (NSString* line in [@(filters) componentsSeparatedByString:@"\n"])
++            {
++                NSArray* f = [line componentsSeparatedByString:@"\t"];
++                if ([f count] != 2) continue;
++                [names addObject:f[0]]; [specs addObject:f[1]];
++            }
++        }
++        if ([specs count])
++        {
++            filter = [[[WineFilePanelFilter alloc] init] autorelease];
++            filter.panel = panel; filter.specs = specs;
++            if ([specs count] > 1)
++            {
++                NSView* view = [[[NSView alloc] initWithFrame:NSMakeRect(0, 0, 420, 44)] autorelease];
++                NSTextField* label = [NSTextField labelWithString:@"Format:"];
++                popup = [[[NSPopUpButton alloc] initWithFrame:NSMakeRect(80, 10, 320, 26) pullsDown:NO] autorelease];
++                [popup addItemsWithTitles:names];
++                [popup setTarget:filter]; [popup setAction:@selector(filterChanged:)];
++                [label setFrame:NSMakeRect(10, 14, 66, 18)]; [label setAlignment:NSTextAlignmentRight];
++                [view addSubview:label]; [view addSubview:popup];
++                panel.accessoryView = view;
++                if (open) open.accessoryViewDisclosed = YES;
++            }
++            NSInteger idx = (*filter_index >= 0 && *filter_index < (int)[specs count]) ? *filter_index : 0;
++            [popup selectItemAtIndex:idx];
++            [filter apply:idx];
++        }
++        /* after the file types, so macOS doesn't append the extension a second time */
++        if (mode == 1 && name && *name) panel.nameFieldStringValue = @(name);
++
++        void (^finish)(NSModalResponse) = ^(NSModalResponse response) {
++            if (response == NSModalResponseOK)
++            {
++                NSMutableArray* paths = [NSMutableArray array];
++                if (open) for (NSURL* url in open.URLs) [paths addObject:url.path];
++                else if (panel.URL) [paths addObject:panel.URL.path];
++                result = [[paths componentsJoinedByString:@"\n"] retain];
++                if (popup) *filter_index = (int)[popup indexOfSelectedItem];
++                ret = 1;
++            }
++            [filter retain]; [filter autorelease];   /* keep the popup target alive until here */
++            dispatch_semaphore_signal(done);
++        };
++
++        [NSApp activateIgnoringOtherApps:YES];
++        if (owner && [owner isVisible] && ![owner attachedSheet])
++            [panel beginSheetModalForWindow:owner completionHandler:finish];
++        else
++            finish([panel runModal]);
++    });
++
++    dispatch_semaphore_wait(done, DISPATCH_TIME_FOREVER);
++    dispatch_release(done);
++    if (ret == 1)
++    {
++        const char* utf8 = [result UTF8String];
++        if ((int)strlen(utf8) + 1 > out_size) ret = -2;
++        else strcpy(out, utf8);
++        [result release];
++    }
++    return ret;
++}
 diff --git a/dlls/winemac.drv/cocoa_window.h b/dlls/winemac.drv/cocoa_window.h
 index a5ee46d..e66e4b2 100644
 --- a/dlls/winemac.drv/cocoa_window.h
@@ -248,6 +416,132 @@ index e15f708..0fad38e 100644
 +        [view release];
 +    });
 +}
+diff --git a/dlls/winemac.drv/dllmain.c b/dlls/winemac.drv/dllmain.c
+index bbd528d..81aff2e 100644
+--- a/dlls/winemac.drv/dllmain.c
++++ b/dlls/winemac.drv/dllmain.c
+@@ -19,12 +19,17 @@
+  */
+ 
+ #include <stdarg.h>
++#include <stdlib.h>
++#include <string.h>
+ #include "ntstatus.h"
+ #include "windef.h"
+ #include "winbase.h"
+ #include "ntgdi.h"
+ #include "macdrv_res.h"
+ #include "shellapi.h"
++#include "winreg.h"
++#include "shlobj.h"
++#include "wine/mac_filepanel.h"
+ #include "unixlib.h"
+ #include "wine/debug.h"
+ 
+@@ -413,3 +418,103 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, void *reserved)
+     macdrv_module = instance;
+     return process_attach();
+ }
++
++
++/***********************************************************************
++ *              wine_macdrv_file_panel   (MACDRV.@)
++ *
++ * Native macOS open/save/folder panel for comdlg32/shell32 (see
++ * include/wine/mac_filepanel.h). Paths are mapped between DOS and unix; a
++ * choice outside the prefix's drives is refused with a message.
++ */
++
++extern char * CDECL wine_get_unix_file_name( LPCWSTR dos );
++extern WCHAR * CDECL wine_get_dos_file_name( LPCSTR unix_name );
++
++static char *to_utf8( const WCHAR *str )
++{
++    int len;
++    char *ret;
++    if (!str) return NULL;
++    len = WideCharToMultiByte( CP_UTF8, 0, str, -1, NULL, 0, NULL, NULL );
++    if ((ret = malloc( len ))) WideCharToMultiByte( CP_UTF8, 0, str, -1, ret, len, NULL, NULL );
++    return ret;
++}
++
++int CDECL wine_macdrv_file_panel( struct mac_file_panel *panel )
++{
++    struct file_panel_params params = {0};
++    char *title = to_utf8( panel->title ), *ok = to_utf8( panel->ok_label ), *name = to_utf8( panel->file_name );
++    char *dir = NULL, *filters = NULL, *out;
++    WCHAR docs[MAX_PATH];
++    const UINT out_size = 64 * 1024;
++    int ret = -1;
++    UINT i;
++
++    if (panel->initial_dir && *panel->initial_dir)
++        dir = wine_get_unix_file_name( panel->initial_dir );
++    if (!dir && SUCCEEDED( SHGetFolderPathW( NULL, CSIDL_PERSONAL, NULL, 0, docs ) ))
++        dir = wine_get_unix_file_name( docs );
++
++    if (panel->filter_count)
++    {
++        size_t size = 1;
++        for (i = 0; i < panel->filter_count; i++)
++            size += 3 * (lstrlenW( panel->filter_names[i] ) + lstrlenW( panel->filter_specs[i] )) + 2;
++        if ((filters = calloc( 1, size )))
++            for (i = 0; i < panel->filter_count; i++)
++            {
++                char *n = to_utf8( panel->filter_names[i] ), *s = to_utf8( panel->filter_specs[i] );
++                if (n && s) { strcat( filters, n ); strcat( filters, "\t" ); strcat( filters, s ); strcat( filters, "\n" ); }
++                free( n ); free( s );
++            }
++    }
++
++    if (!(out = malloc( out_size ))) goto done;
++    params.owner = (UINT_PTR)panel->owner;
++    params.mode = panel->mode;
++    params.multi = panel->multi;
++    params.title = (UINT_PTR)title;
++    params.ok_label = (UINT_PTR)ok;
++    params.dir = (UINT_PTR)dir;
++    params.name = (UINT_PTR)name;
++    params.filters = (UINT_PTR)filters;
++    params.out = (UINT_PTR)out;
++    params.out_size = out_size;
++
++    for (;;)
++    {
++        WCHAR *dst = panel->results, *end = panel->results + panel->results_size - 1;
++        BOOL outside = FALSE;
++        char *path, *next;
++
++        params.filter_index = panel->filter_index;
++        if (MACDRV_CALL( file_panel, &params ) || params.ret < 0) { ret = -1; break; }
++        if (!params.ret) { ret = 0; break; }
++
++        for (path = out; path && *path; path = next)
++        {
++            WCHAR *dos;
++            if ((next = strchr( path, '\n' ))) *next++ = 0;
++            if (!(dos = wine_get_dos_file_name( path ))) continue;
++            if (!wcsncmp( dos, L"\\\\?\\", 4 )) outside = TRUE;
++            else if (dst + lstrlenW( dos ) + 1 < end) { lstrcpyW( dst, dos ); dst += lstrlenW( dos ) + 1; }
++            HeapFree( GetProcessHeap(), 0, dos );
++        }
++        *dst = 0;
++        if (!outside && dst != panel->results)
++        {
++            panel->filter_index = params.filter_index;
++            ret = 1;
++            break;
++        }
++        MessageBoxW( panel->owner, L"This location isn't available to Windows programs.\n\n"
++                     L"Choose a folder inside your Inventor folder (~/Inventor, drive D:).",
++                     panel->title ? panel->title : L"Choose a location", MB_OK | MB_ICONINFORMATION );
++    }
++
++done:
++    free( out ); free( filters ); free( title ); free( ok ); free( name );
++    if (dir) HeapFree( GetProcessHeap(), 0, dir );
++    return ret;
++}
 diff --git a/b/dlls/winemac.drv/dxmt.c b/dlls/winemac.drv/dxmt.c
 new file mode 100644
 index 0000000..9d046be
@@ -430,7 +724,7 @@ index 89c498f..8c965ff 100644
  extern WineWindow *macdrv_get_cocoa_window(HWND hwnd, bool require_on_screen);
  extern RGNDATA *get_region_data(HRGN hrgn, HDC hdc_lptodp);
 diff --git a/dlls/winemac.drv/macdrv_cocoa.h b/dlls/winemac.drv/macdrv_cocoa.h
-index 5157b38..dba7e3e 100644
+index 5157b38..f538ed9 100644
 --- a/dlls/winemac.drv/macdrv_cocoa.h
 +++ b/dlls/winemac.drv/macdrv_cocoa.h
 @@ -103,6 +103,8 @@ struct macdrv_query;
@@ -450,15 +744,18 @@ index 5157b38..dba7e3e 100644
  };
  
  struct macdrv_window_state {
-@@ -482,6 +485,7 @@ extern void macdrv_order_cocoa_window(WineWindow *window, WineWindow *prev,
+@@ -482,6 +485,10 @@ extern void macdrv_order_cocoa_window(WineWindow *window, WineWindow *prev,
  extern void macdrv_hide_cocoa_window(WineWindow *window);
  extern void macdrv_set_cocoa_window_frame(WineWindow *window, const CGRect* new_frame);
  extern void macdrv_get_cocoa_window_frame(WineWindow *window, CGRect* out_frame);
 +extern void macdrv_start_window_drag(WineWindow *window);
++extern int macdrv_run_file_panel(WineWindow *owner, int mode, int multi, const char *title, const char *ok_label,
++                                 const char *dir, const char *name, const char *filters, int *filter_index,
++                                 char *out, int out_size);
  extern void macdrv_set_cocoa_parent_window(WineWindow *window, WineWindow *parent);
  extern void macdrv_window_set_color_image(WineWindow *window, CGImageRef image, CGRect rect, CGRect dirty);
  extern void macdrv_window_set_shape_image(WineWindow *window, CGImageRef image);
-@@ -503,6 +507,8 @@ extern void macdrv_release_metal_device(MTLDevice_id device);
+@@ -503,6 +510,8 @@ extern void macdrv_release_metal_device(MTLDevice_id device);
  extern WineMetalView *macdrv_view_create_metal_view(WineContentView *view, MTLDevice_id device);
  extern CAMetalLayer *macdrv_view_get_metal_layer(WineMetalView *view);
  extern void macdrv_view_release_metal_view(WineMetalView *view);
@@ -468,7 +765,7 @@ index 5157b38..dba7e3e 100644
  extern WineMetalSwapChain_id macdrv_create_offscreen_swapchain(void* hwnd, CGRect bounds);
  extern CAMetalLayer *macdrv_swapchain_get_layer(WineMetalSwapChain_id swapchain);
 diff --git a/dlls/winemac.drv/macdrv_main.c b/dlls/winemac.drv/macdrv_main.c
-index cc3d3b3..cabf5c2 100644
+index cc3d3b3..bf08682 100644
 --- a/dlls/winemac.drv/macdrv_main.c
 +++ b/dlls/winemac.drv/macdrv_main.c
 @@ -52,6 +52,8 @@ bool cursor_clipping_locks_windows = true;
@@ -503,6 +800,50 @@ index cc3d3b3..cabf5c2 100644
      if (!get_config_key(hkey, appkey, "WindowsFloatWhenInactive", buffer, sizeof(buffer)))
      {
          static const WCHAR noneW[] = {'n','o','n','e',0};
+@@ -594,10 +612,26 @@ static NTSTATUS macdrv_quit_result(void *arg)
+ }
+ 
+ 
++static NTSTATUS macdrv_file_panel(void *arg)
++{
++    struct file_panel_params *p = arg;
++    HWND owner = (HWND)(UINT_PTR)p->owner;
++    WineWindow *window = owner ? macdrv_get_cocoa_window(NtUserGetAncestor(owner, GA_ROOT), FALSE) : NULL;
++    int index = p->filter_index;
++
++    p->ret = macdrv_run_file_panel(window, p->mode, p->multi, (const char *)(UINT_PTR)p->title,
++                                   (const char *)(UINT_PTR)p->ok_label, (const char *)(UINT_PTR)p->dir,
++                                   (const char *)(UINT_PTR)p->name, (const char *)(UINT_PTR)p->filters,
++                                   &index, (char *)(UINT_PTR)p->out, p->out_size);
++    p->filter_index = index;
++    return STATUS_SUCCESS;
++}
++
+ const unixlib_entry_t __wine_unix_call_funcs[] =
+ {
+     macdrv_init,
+     macdrv_quit_result,
++    macdrv_file_panel,
+ };
+ 
+ C_ASSERT( ARRAYSIZE(__wine_unix_call_funcs) == unix_funcs_count );
+@@ -620,10 +654,16 @@ static NTSTATUS wow64_init(void *arg)
+     return macdrv_init(&params);
+ }
+ 
++static NTSTATUS wow64_file_panel(void *arg)
++{
++    return STATUS_NOT_SUPPORTED;   /* 32-bit callers keep Wine's dialog */
++}
++
+ const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
+ {
+     wow64_init,
+     macdrv_quit_result,
++    wow64_file_panel,
+ };
+ 
+ C_ASSERT( ARRAYSIZE(__wine_unix_call_wow64_funcs) == unix_funcs_count );
 diff --git a/dlls/winemac.drv/surface.c b/dlls/winemac.drv/surface.c
 index 5552b82..1404e2b 100644
 --- a/dlls/winemac.drv/surface.c
@@ -574,6 +915,40 @@ index 5552b82..1404e2b 100644
      CGImageRelease(image);
  
      if (shape_changed)
+diff --git a/dlls/winemac.drv/unixlib.h b/dlls/winemac.drv/unixlib.h
+index dc22da0..fb70b8b 100644
+--- a/dlls/winemac.drv/unixlib.h
++++ b/dlls/winemac.drv/unixlib.h
+@@ -23,11 +23,29 @@ enum macdrv_funcs
+ {
+     unix_init,
+     unix_quit_result,
++    unix_file_panel,
+     unix_funcs_count
+ };
+ 
+ #define MACDRV_CALL(func, params) WINE_UNIX_CALL(unix_ ## func, params)
+ 
++/* macdrv_file_panel params: UTF-8 strings, unix paths */
++struct file_panel_params
++{
++    UINT64 owner;
++    UINT   mode;
++    UINT   multi;
++    UINT64 title;
++    UINT64 ok_label;
++    UINT64 dir;
++    UINT64 name;
++    UINT64 filters;
++    INT    filter_index;
++    UINT64 out;
++    UINT   out_size;
++    INT    ret;
++};
++
+ /* macdrv_init params */
+ struct localized_string
+ {
 diff --git a/dlls/winemac.drv/window.c b/dlls/winemac.drv/window.c
 index 552971f..18a8ec2 100644
 --- a/dlls/winemac.drv/window.c
@@ -669,3 +1044,10 @@ index 552971f..18a8ec2 100644
  }
  
  
+diff --git a/b/dlls/winemac.drv/winemac.drv.spec b/dlls/winemac.drv/winemac.drv.spec
+new file mode 100644
+index 0000000..965a2c3
+--- /dev/null
++++ b/dlls/winemac.drv/winemac.drv.spec
+@@ -0,0 +1 @@
++@ cdecl wine_macdrv_file_panel(ptr)

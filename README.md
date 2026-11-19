@@ -31,6 +31,7 @@ Mac app.
 | Part modelling, 3D viewport through Metal (DXMT) | ✅ |
 | Inventor COM/.NET API (see [examples](examples/automation)) | ✅ |
 | Native macOS windows: Retina, app name, resize, drag | ✅ |
+| Native macOS Open / Save / folder panels | ✅ |
 | macOS tiling, full screen and Split View | ✅ |
 
 | Known limitations | |
@@ -100,7 +101,7 @@ gussets, four M8 holes, rounds) and saves it to `~/Inventor/Examples`. See
 ## Documentation
 
 * [How it works](docs/how-it-works.md) – the stack, and everything that had to change for macOS
-* [winemac.drv patch](docs/wine-patches.md) – each Wine change, why, and how to rebuild the driver
+* [Wine patches](docs/wine-patches.md) – each Wine change (incl. native file dialogs), why, and how to rebuild the driver
 * [Troubleshooting](docs/troubleshooting.md)
 
 ## Credits

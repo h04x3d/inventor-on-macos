@@ -1,0 +1,377 @@
+diff --git a/include/Makefile.in b/include/Makefile.in
+index 3f23c63..e23e930 100644
+--- a/include/Makefile.in
++++ b/include/Makefile.in
+@@ -1132,6 +1132,7 @@ SOURCES = \
+ 	wine/irpcss.idl \
+ 	wine/itss.idl \
+ 	wine/list.h \
++	wine/mac_filepanel.h \
+ 	wine/lsass.idl \
+ 	wine/mfinternal.idl \
+ 	wine/mmsystem16.h \
+diff --git a/dlls/comdlg32/itemdlg.c b/dlls/comdlg32/itemdlg.c
+index d8c64a2..4bd5ce0 100644
+--- a/dlls/comdlg32/itemdlg.c
++++ b/dlls/comdlg32/itemdlg.c
+@@ -34,6 +34,7 @@
+ 
+ #include "wine/debug.h"
+ #include "wine/list.h"
++#include "wine/mac_filepanel.h"
+ 
+ #define IDC_NAV_TOOLBAR      200
+ #define IDC_NAVBACK          201
+@@ -2369,14 +2370,105 @@ static INT_PTR CALLBACK itemdlg_dlgproc(HWND hwnd, UINT umessage, WPARAM wparam,
+     return FALSE;
+ }
+ 
++/* Native macOS panel (winemac.drv). E_NOTIMPL = not available, use Wine's dialog. */
++static HRESULT show_mac_panel(FileDialogImpl *This, HWND parent)
++{
++    mac_file_panel_func panel_func = get_mac_file_panel();
++    struct mac_file_panel panel = {0};
++    const WCHAR **names = NULL, **specs = NULL;
++    WCHAR *dir = NULL, *name = NULL, *results = NULL, *p;
++    IShellItem *folder = This->psi_setfolder ? This->psi_setfolder : This->psi_defaultfolder;
++    HRESULT hr = E_NOTIMPL;
++    UINT i, count;
++    int ret;
++
++    /* apps that add their own controls get Wine's dialog, which can show them */
++    if (!panel_func || !list_empty(&This->cctrls)) return E_NOTIMPL;
++
++    if (folder) IShellItem_GetDisplayName(folder, SIGDN_FILESYSPATH, &dir);
++    if (This->set_filename)
++    {
++        name = StrDupW(This->set_filename);
++        if ((p = wcsrchr(name, '\\')))
++        {
++            *p = 0;
++            if (!dir) { dir = CoTaskMemAlloc((lstrlenW(name) + 1) * sizeof(WCHAR)); lstrcpyW(dir, name); }
++            memmove(name, p + 1, (lstrlenW(p + 1) + 1) * sizeof(WCHAR));
++        }
++    }
++    if (This->filterspec_count)
++    {
++        names = malloc(This->filterspec_count * sizeof(*names));
++        specs = malloc(This->filterspec_count * sizeof(*specs));
++        for (i = 0; i < This->filterspec_count; i++)
++        {
++            names[i] = This->filterspecs[i].pszName;
++            specs[i] = This->filterspecs[i].pszSpec;
++        }
++    }
++    results = malloc(64 * 1024 * sizeof(WCHAR));
++
++    panel.mode = (This->options & FOS_PICKFOLDERS) ? MAC_FILEPANEL_FOLDER :
++                 This->dlg_type == ITEMDLG_TYPE_SAVE ? MAC_FILEPANEL_SAVE : MAC_FILEPANEL_OPEN;
++    panel.multi = !!(This->options & FOS_ALLOWMULTISELECT);
++    panel.owner = parent;
++    panel.title = This->custom_title;
++    panel.ok_label = This->custom_okbutton;
++    panel.initial_dir = dir;
++    panel.file_name = name;
++    panel.filter_count = This->filterspec_count;
++    panel.filter_names = names;
++    panel.filter_specs = specs;
++    panel.filter_index = This->filetypeindex;
++    panel.results = results;
++    panel.results_size = 64 * 1024;
++
++    while ((ret = panel_func(&panel)) == 1)
++    {
++        LPITEMIDLIST pidls[256];
++        IShellFolder *desktop;
++
++        for (count = 0, p = results; *p && count < ARRAY_SIZE(pidls); p += lstrlenW(p) + 1)
++            if (SUCCEEDED(SHParseDisplayName(p, NULL, &pidls[count], 0, NULL)))
++                count++;
++            else if (This->dlg_type == ITEMDLG_TYPE_SAVE && (pidls[count] = SHSimpleIDListFromPath(p)))
++                count++;   /* new file: doesn't exist yet */
++        if (!count) { hr = E_FAIL; break; }
++
++        if (This->psia_results) { IShellItemArray_Release(This->psia_results); This->psia_results = NULL; }
++        SHGetDesktopFolder(&desktop);
++        hr = SHCreateShellItemArray(NULL, desktop, count, (PCUITEMID_CHILD_ARRAY)pidls, &This->psia_results);
++        IShellFolder_Release(desktop);
++        for (i = 0; i < count; i++) ILFree(pidls[i]);
++        if (FAILED(hr)) break;
++
++        if (This->filterspec_count && panel.filter_index < This->filterspec_count)
++        {
++            This->filetypeindex = panel.filter_index;
++            set_current_filter(This, This->filterspecs[This->filetypeindex].pszSpec);
++        }
++        if (events_OnFileOk(This) == S_OK) { hr = S_OK; break; }
++    }
++    if (ret == 0) hr = HRESULT_FROM_WIN32(ERROR_CANCELLED);
++    if (ret < 0) hr = E_NOTIMPL;
++
++    free(names); free(specs); free(results); LocalFree(name);
++    CoTaskMemFree(dir);
++    return hr;
++}
++
+ static HRESULT create_dialog(FileDialogImpl *This, HWND parent)
+ {
+     ULONG_PTR ctx_cookie = 0;
+     INT_PTR res;
++    HRESULT hr;
+ 
+     if (This->dlg_hwnd)
+         return E_UNEXPECTED;
+ 
++    if ((hr = show_mac_panel(This, parent)) != E_NOTIMPL)
++        return hr;
++
+     if (!GetCurrentActCtx(&This->user_actctx))
+         This->user_actctx = INVALID_HANDLE_VALUE;
+ 
+diff --git a/dlls/comdlg32/filedlg.c b/dlls/comdlg32/filedlg.c
+index 286b9f4..2d2790e 100644
+--- a/dlls/comdlg32/filedlg.c
++++ b/dlls/comdlg32/filedlg.c
+@@ -69,6 +69,7 @@
+ #include "shlwapi.h"
+ 
+ #include "wine/debug.h"
++#include "wine/mac_filepanel.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(commdlg);
+ 
+@@ -4148,6 +4149,90 @@ static inline BOOL is_win16_looks(DWORD flags)
+ 
+ /* ------------------ APIs ---------------------- */
+ 
++
++/* Native macOS panel for plain GetOpen/SaveFileNameW calls (no hooks/templates).
++ * Returns 1 chosen, 0 cancelled, -1 use Wine's dialog. */
++static int mac_panel_ofn(OPENFILENAMEW *ofn, BOOL save)
++{
++    mac_file_panel_func panel_func = get_mac_file_panel();
++    struct mac_file_panel panel = {0};
++    const WCHAR *names[64], *specs[64], *f;
++    WCHAR *results, *dir = NULL, *name = NULL, *p, *first;
++    UINT count = 0, len;
++    int ret;
++
++    if (!panel_func || (ofn->Flags & (OFN_ENABLEHOOK | OFN_ENABLETEMPLATE | OFN_ENABLETEMPLATEHANDLE))) return -1;
++    for (f = ofn->lpstrFilter; f && *f && count < ARRAY_SIZE(names); )
++    {
++        names[count] = f; f += lstrlenW(f) + 1;
++        if (!*f) break;
++        specs[count++] = f; f += lstrlenW(f) + 1;
++    }
++    if (ofn->lpstrFile && *ofn->lpstrFile)
++    {
++        name = wcsdup(ofn->lpstrFile);
++        if ((p = wcsrchr(name, '\\')))
++        {
++            *p = 0; dir = wcsdup(name);
++            memmove(name, p + 1, (lstrlenW(p + 1) + 1) * sizeof(WCHAR));
++        }
++    }
++    if (!(results = malloc(64 * 1024 * sizeof(WCHAR)))) return -1;
++
++    panel.mode = save ? MAC_FILEPANEL_SAVE : MAC_FILEPANEL_OPEN;
++    panel.multi = !save && (ofn->Flags & OFN_ALLOWMULTISELECT);
++    panel.owner = ofn->hwndOwner;
++    panel.title = ofn->lpstrTitle;
++    panel.initial_dir = ofn->lpstrInitialDir && *ofn->lpstrInitialDir ? ofn->lpstrInitialDir : dir;
++    panel.file_name = name;
++    panel.filter_count = count;
++    panel.filter_names = names;
++    panel.filter_specs = specs;
++    panel.filter_index = ofn->nFilterIndex ? ofn->nFilterIndex - 1 : 0;
++    panel.results = results;
++    panel.results_size = 64 * 1024;
++
++    ret = panel_func(&panel);
++    if (ret == 1)
++    {
++        UINT n = 0, total;
++        for (p = results; *p; p += lstrlenW(p) + 1) n++;
++        first = results;
++        if (save && ofn->lpstrDefExt && *ofn->lpstrDefExt && !wcschr(wcsrchr(first, '\\') ? wcsrchr(first, '\\') : first, '.'))
++        {
++            lstrcatW(first, L"."); lstrcatW(first, ofn->lpstrDefExt); first[lstrlenW(first) + 1] = 0;
++        }
++        if (n > 1 && (ofn->Flags & OFN_ALLOWMULTISELECT))
++        {
++            /* explorer style: directory\0name1\0name2\0\0 */
++            WCHAR *dst = ofn->lpstrFile;
++            len = wcsrchr(first, '\\') - first;
++            total = len + 2;
++            for (p = results; *p; p += lstrlenW(p) + 1) total += lstrlenW(wcsrchr(p, '\\') + 1) + 1;
++            if (total > ofn->nMaxFile) { COMDLG32_SetCommDlgExtendedError(FNERR_BUFFERTOOSMALL); ret = 0; goto done; }
++            memcpy(dst, first, len * sizeof(WCHAR)); dst[len] = 0; dst += len + 1;
++            for (p = results; *p; p += lstrlenW(p) + 1) { lstrcpyW(dst, wcsrchr(p, '\\') + 1); dst += lstrlenW(dst) + 1; }
++            *dst = 0;
++            ofn->nFileOffset = len + 1;
++            ofn->nFileExtension = 0;
++        }
++        else
++        {
++            WCHAR *base = wcsrchr(first, '\\') ? wcsrchr(first, '\\') + 1 : first, *ext = wcsrchr(base, '.');
++            if ((UINT)lstrlenW(first) + 2 > ofn->nMaxFile) { COMDLG32_SetCommDlgExtendedError(FNERR_BUFFERTOOSMALL); ret = 0; goto done; }
++            lstrcpyW(ofn->lpstrFile, first); ofn->lpstrFile[lstrlenW(first) + 1] = 0;
++            ofn->nFileOffset = base - first;
++            ofn->nFileExtension = ext ? ext - first + 1 : 0;
++            if (ofn->lpstrFileTitle && ofn->nMaxFileTitle) lstrcpynW(ofn->lpstrFileTitle, base, ofn->nMaxFileTitle);
++        }
++        ofn->nFilterIndex = panel.filter_index + 1;
++    }
++    else if (ret == 0) COMDLG32_SetCommDlgExtendedError(0);
++done:
++    free(results); free(dir); free(name);
++    return ret;
++}
++
+ /***********************************************************************
+  *            GetOpenFileNameA  (COMDLG32.@)
+  *
+@@ -4212,7 +4297,9 @@ BOOL WINAPI GetOpenFileNameW(OPENFILENAMEW *ofn)
+     else
+     {
+         FileOpenDlgInfos info;
++        int mac = mac_panel_ofn(ofn, FALSE);
+ 
++        if (mac >= 0) return mac == 1;
+         init_filedlg_infoW(ofn, &info);
+         return GetFileDialog95(&info, OPEN_DIALOG);
+     }
+@@ -4272,7 +4359,9 @@ BOOL WINAPI GetSaveFileNameW(
+     else
+     {
+         FileOpenDlgInfos info;
++        int mac = mac_panel_ofn(ofn, TRUE);
+ 
++        if (mac >= 0) return mac == 1;
+         init_filedlg_infoW(ofn, &info);
+         return GetFileDialog95(&info, SAVE_DIALOG);
+     }
+diff --git a/dlls/shell32/brsfolder.c b/dlls/shell32/brsfolder.c
+index 36607ca..123590d 100644
+--- a/dlls/shell32/brsfolder.c
++++ b/dlls/shell32/brsfolder.c
+@@ -26,6 +26,7 @@
+ 
+ #define COBJMACROS
+ #include "wine/debug.h"
++#include "wine/mac_filepanel.h"
+ #include "pidl.h"
+ #include "shell32_main.h"
+ #include "commoncontrols.h"
+@@ -1203,14 +1204,48 @@ LPITEMIDLIST WINAPI SHBrowseForFolderA (LPBROWSEINFOA lpbi)
+  * NOTES
+  *  crashes when passed a null pointer
+  */
++/* Native macOS folder panel (winemac.drv); NULL + *used = FALSE means use Wine's dialog */
++static LPITEMIDLIST mac_browse_for_folder(LPBROWSEINFOW lpbi, BOOL *used)
++{
++    mac_file_panel_func panel_func = get_mac_file_panel();
++    struct mac_file_panel panel = {0};
++    WCHAR result[MAX_PATH + 2], *name;
++    LPITEMIDLIST pidl = NULL;
++    int ret;
++
++    *used = FALSE;
++    if (!panel_func || (lpbi->ulFlags & (BIF_BROWSEFORCOMPUTER | BIF_BROWSEFORPRINTER | BIF_BROWSEINCLUDEFILES)))
++        return NULL;
++    panel.mode = MAC_FILEPANEL_FOLDER;
++    panel.owner = lpbi->hwndOwner;
++    panel.title = lpbi->lpszTitle;
++    panel.results = result;
++    panel.results_size = ARRAY_SIZE(result);
++    if ((ret = panel_func(&panel)) < 0) return NULL;
++    *used = TRUE;
++    if (ret == 0) return NULL;
++    if (FAILED(SHParseDisplayName(result, NULL, &pidl, 0, NULL))) return NULL;
++    if (lpbi->pszDisplayName)
++    {
++        name = wcsrchr(result, '\\');
++        lstrcpynW(lpbi->pszDisplayName, name && name[1] ? name + 1 : result, MAX_PATH);
++    }
++    return pidl;
++}
++
+ LPITEMIDLIST WINAPI SHBrowseForFolderW (LPBROWSEINFOW lpbi)
+ {
++    BOOL mac_used;
++    LPITEMIDLIST mac_pidl;
+     browse_info info;
+     DWORD r;
+     HRESULT hr;
+     const WCHAR * templateName;
+     INITCOMMONCONTROLSEX icex;
+ 
++    mac_pidl = mac_browse_for_folder(lpbi, &mac_used);
++    if (mac_used) return mac_pidl;
++
+     info.hWnd = 0;
+     info.pidlRet = NULL;
+     info.lpBrowseInfo = lpbi;
+diff --git a/include/wine/mac_filepanel.h b/include/wine/mac_filepanel.h
+new file mode 100644
+index 0000000..e7a4020
+--- /dev/null
++++ b/include/wine/mac_filepanel.h
+@@ -0,0 +1,57 @@
++/*
++ * Native macOS file panels for Wine's file dialogs (winemac.drv export).
++ *
++ * comdlg32 / shell32 look up "wine_macdrv_file_panel" in winemac.drv; when it is
++ * there (and HKCU\Software\Wine\Mac Driver\NativeFileDialogs isn't "n") they show
++ * an NSOpenPanel/NSSavePanel instead of Wine's own dialog.
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ */
++#ifndef __WINE_MAC_FILEPANEL_H
++#define __WINE_MAC_FILEPANEL_H
++
++#include "winreg.h"
++
++#define MAC_FILEPANEL_OPEN    0
++#define MAC_FILEPANEL_SAVE    1
++#define MAC_FILEPANEL_FOLDER  2
++
++struct mac_file_panel
++{
++    UINT          mode;           /* MAC_FILEPANEL_* */
++    UINT          multi;          /* allow multiple selection (open) */
++    HWND          owner;
++    const WCHAR  *title;          /* may be NULL */
++    const WCHAR  *ok_label;       /* may be NULL */
++    const WCHAR  *initial_dir;    /* DOS path, may be NULL */
++    const WCHAR  *file_name;      /* save: proposed name, may be NULL */
++    UINT          filter_count;
++    const WCHAR *const *filter_names;   /* "Inventor Part (*.ipt)" */
++    const WCHAR *const *filter_specs;   /* "*.ipt;*.iam" */
++    UINT          filter_index;   /* in/out, 0-based */
++    WCHAR        *results;        /* out: DOS paths, each NUL-terminated, list ends with an extra NUL */
++    UINT          results_size;   /* in WCHARs */
++};
++
++/* returns 1 = chosen, 0 = cancelled, -1 = not available (use Wine's dialog) */
++typedef int (CDECL *mac_file_panel_func)(struct mac_file_panel *panel);
++
++static inline mac_file_panel_func get_mac_file_panel(void)
++{
++    static const WCHAR keyW[] = {'S','o','f','t','w','a','r','e','\\','W','i','n','e','\\','M','a','c',' ','D','r','i','v','e','r',0};
++    static const WCHAR valueW[] = {'N','a','t','i','v','e','F','i','l','e','D','i','a','l','o','g','s',0};
++    static const WCHAR drvW[] = {'w','i','n','e','m','a','c','.','d','r','v',0};
++    WCHAR buf[8] = {0};
++    DWORD size = sizeof(buf);
++    HMODULE mod = GetModuleHandleW(drvW);
++    if (!mod) return NULL;
++    if (!RegGetValueW(HKEY_CURRENT_USER, keyW, valueW, RRF_RT_REG_SZ, NULL, buf, &size) &&
++        (buf[0] == 'n' || buf[0] == 'N' || buf[0] == '0' || buf[0] == 'f' || buf[0] == 'F'))
++        return NULL;
++    return (mac_file_panel_func)GetProcAddress(mod, "wine_macdrv_file_panel");
++}
++
++#endif

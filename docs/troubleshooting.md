@@ -16,6 +16,8 @@ plus the Linux project's install logs), Inventor's own logs under
 | 3D viewport empty | check the log for `Failed to create metal view` → the Wine runtime is missing the winemac.drv patch or `winemetal.so` |
 | Home tab is blank | known limitation (WebView2, see how-it-works.md). Use *File → New/Open* |
 | Fuzzy UI | Retina mode: `HKCU\Software\Wine\Mac Driver\RetinaMode=y` and `LogPixels=192`; change `INV_DPI` (e.g. 168 = 175 %) for more room |
+| A Save/Open panel refuses a folder | the Windows side only sees `C:` and `~/Inventor` (`D:`); save inside `~/Inventor` |
+| Want Wine's own file dialogs back | `HKCU\Software\Wine\Mac Driver` → `NativeFileDialogs` = `n` |
 | `wineserver: sock_get_ntstatus() can't map error: Host is down` | harmless network probing noise |
 
 Useful while debugging: `tools/` has tiny Win32 programs (build with `make -C

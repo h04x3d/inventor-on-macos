@@ -1,8 +1,9 @@
-# winemac.drv patch
+# Wine patches
 
-`patches/wine/0001-winemac.drv-inventor-on-macos.patch` applies to stock Wine
-11.20 (the winum series doesn't touch `dlls/winemac.drv`). It is LGPL-2.1, like
-Wine.
+Both apply, in order, on top of Wine 11.20 + the winum series. LGPL-2.1, like Wine.
+
+* `0001-winemac.drv-inventor-on-macos.patch` – the macOS driver changes below
+* `0002-native-macos-file-dialogs.patch` – native macOS Open/Save/folder panels (see the end)
 
 | Area | Files | Problem | Change |
 |---|---|---|---|
@@ -16,6 +17,26 @@ Wine.
 
 Debug output: set `DXMT_SHIM_DEBUG=1` before launching to log DXMT view
 creation/updates, `SC_*` system commands and the edge fill.
+
+## Native file dialogs (0002, plus `cocoa_filepanel.m` and the `wine_macdrv_file_panel` export in 0001)
+
+Wine's own file dialogs imitate Windows XP (blurry 16 px icons at Retina scale,
+"My Computer/Trash" tree). With the patch, the three Windows entry points show
+the real macOS panels instead – as a sheet on the program's window, with a
+*Format* popup built from the program's file types:
+
+| Windows API | Used by | macOS |
+|---|---|---|
+| `IFileOpenDialog` / `IFileSaveDialog` (incl. `FOS_PICKFOLDERS`) | .NET, MFC, most modern apps | `NSOpenPanel` / `NSSavePanel` |
+| `GetOpenFileNameW` / `GetSaveFileNameW` | older apps | same |
+| `SHBrowseForFolderW` | folder pickers | `NSOpenPanel` choosing directories |
+
+comdlg32/shell32 call `wine_macdrv_file_panel` (exported by winemac.drv, see
+`include/wine/mac_filepanel.h`), which maps DOS ⇄ unix paths. A location outside
+the prefix's drives is refused with a short message (the prefix is sandboxed to
+`C:` and `D:` = `~/Inventor`). Wine's dialog is still used when the program adds
+its own controls (`IFileDialogCustomize`), hooks or templates, for 32-bit
+programs, or when `HKCU\Software\Wine\Mac Driver\NativeFileDialogs` is `n`.
 
 ## Rebuilding just the driver
 

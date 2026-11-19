@@ -24,8 +24,10 @@ if [ ! -d "$SRC" ]; then
         # one test-only hunk of win32u-fixed-negative-mat2 is already upstream; ignore it
         (cd "$SRC" && patch -p1 -s -N < "$INVMAC_HOME/winum/patches/$p") >/dev/null || echo "   (patch $p: partly already applied)"
     done < "$INVMAC_HOME/winum/patches/series"
-    info "inventor-on-macos winemac.drv patch"
-    (cd "$SRC" && patch -p1 < "$REPO_DIR/patches/wine/0001-winemac.drv-inventor-on-macos.patch")
+    for p in "$REPO_DIR"/patches/wine/*.patch; do
+        info "inventor-on-macos: $(basename "$p")"
+        (cd "$SRC" && patch -p1 < "$p")
+    done
 fi
 
 info "configure (x86_64, macOS display driver, no X11)"
