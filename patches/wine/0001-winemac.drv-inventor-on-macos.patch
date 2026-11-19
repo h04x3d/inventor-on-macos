@@ -1,0 +1,671 @@
+diff --git a/dlls/winemac.drv/Makefile.in b/dlls/winemac.drv/Makefile.in
+index 1eb2b9c..811974e 100644
+--- a/dlls/winemac.drv/Makefile.in
++++ b/dlls/winemac.drv/Makefile.in
+@@ -28,6 +28,7 @@ SOURCES = \
+ 	cocoa_window.m \
+ 	display.c \
+ 	dllmain.c \
++	dxmt.c \
+ 	event.c \
+ 	gdi.c \
+ 	image.c \
+diff --git a/dlls/winemac.drv/cocoa_app.m b/dlls/winemac.drv/cocoa_app.m
+index 0e3cbb5..41b9a7b 100644
+--- a/dlls/winemac.drv/cocoa_app.m
++++ b/dlls/winemac.drv/cocoa_app.m
+@@ -19,6 +19,7 @@
+  */
+ 
+ #import "config.h"
++#include <dlfcn.h>
+ #import "macdrv.h"
+ 
+ #import "cocoa_app.h"
+@@ -231,8 +232,28 @@ - (void) transformProcessToForeground:(BOOL)activateIfTransformed
+             NSString* title;
+             NSMenuItem* item;
+ 
++            if (macdrv_app_name_len)
++            {
++                NSString* name = [NSString stringWithCharacters:macdrv_app_name length:macdrv_app_name_len];
++                [[NSProcessInfo processInfo] setProcessName:name];
++            }
++
+             [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+ 
++            if (macdrv_app_name_len)
++            {
++                /* Dock / app switcher label: LaunchServices display name (private API, as used by Chromium) */
++                typedef CFTypeRef (*get_asn_t)(void);
++                typedef OSStatus (*set_item_t)(int, CFTypeRef, CFStringRef, CFStringRef, CFDictionaryRef*);
++                get_asn_t get_asn = dlsym(RTLD_DEFAULT, "_LSGetCurrentApplicationASN");
++                set_item_t set_item = dlsym(RTLD_DEFAULT, "_LSSetApplicationInformationItem");
++                CFStringRef* key = dlsym(RTLD_DEFAULT, "_kLSDisplayNameKey");
++                NSString* name = [NSString stringWithCharacters:macdrv_app_name length:macdrv_app_name_len];
++                CFTypeRef asn;
++                if (get_asn && set_item && key && (asn = get_asn()))
++                    set_item(-2 /* kLSDefaultSessionID */, asn, *key, (CFStringRef)name, NULL);
++            }
++
+             if (activateIfTransformed)
+                 [self tryToActivateIgnoringOtherApps:YES];
+ 
+@@ -247,6 +268,8 @@ - (void) transformProcessToForeground:(BOOL)activateIfTransformed
+             // Application menu
+             submenu = [[[NSMenu alloc] initWithTitle:WineLocalizedString(STRING_MENU_WINE)] autorelease];
+             bundleName = [[NSBundle mainBundle] objectForInfoDictionaryKey:(NSString*)kCFBundleNameKey];
++            if (macdrv_app_name_len)
++                bundleName = [NSString stringWithCharacters:macdrv_app_name length:macdrv_app_name_len];
+ 
+             if ([bundleName length])
+                 title = [NSString stringWithFormat:WineLocalizedString(STRING_MENU_ITEM_HIDE_APPNAME), bundleName];
+diff --git a/dlls/winemac.drv/cocoa_window.h b/dlls/winemac.drv/cocoa_window.h
+index a5ee46d..e66e4b2 100644
+--- a/dlls/winemac.drv/cocoa_window.h
++++ b/dlls/winemac.drv/cocoa_window.h
+@@ -69,6 +69,8 @@
+     NSTimeInterval enteredFullScreenTime;
+ 
+     int draggingPhase;
++    NSEvent* lastLeftMouseDown;
++    BOOL appDrawnFrame;
+     NSPoint dragStartPosition;
+     NSPoint dragWindowStartPosition;
+ 
+diff --git a/dlls/winemac.drv/cocoa_window.m b/dlls/winemac.drv/cocoa_window.m
+index e15f708..0fad38e 100644
+--- a/dlls/winemac.drv/cocoa_window.m
++++ b/dlls/winemac.drv/cocoa_window.m
+@@ -69,7 +69,13 @@ static NSUInteger style_mask_for_features(const struct macdrv_window_features* w
+ {
+     NSUInteger style_mask;
+ 
+-    if (wf->title_bar)
++    if (wf->app_drawn_frame)
++    {
++        style_mask = NSWindowStyleMaskTitled | NSWindowStyleMaskFullSizeContentView | NSWindowStyleMaskClosable |
++                     NSWindowStyleMaskResizable;
++        if (wf->minimize_button) style_mask |= NSWindowStyleMaskMiniaturizable;
++    }
++    else if (wf->title_bar)
+     {
+         style_mask = NSWindowStyleMaskTitled;
+         if (wf->close_button) style_mask |= NSWindowStyleMaskClosable;
+@@ -77,7 +83,12 @@ static NSUInteger style_mask_for_features(const struct macdrv_window_features* w
+         if (wf->resizable || wf->maximize_button) style_mask |= NSWindowStyleMaskResizable;
+         if (wf->utility) style_mask |= NSWindowStyleMaskUtilityWindow;
+     }
+-    else style_mask = NSWindowStyleMaskBorderless;
++    else
++    {
++        style_mask = NSWindowStyleMaskBorderless;
++        /* app-drawn frame (caption + thick frame, no non-client area): native edge resizing */
++        if (wf->resizable) style_mask |= NSWindowStyleMaskResizable;
++    }
+ 
+     if (wf->prevents_app_activation) style_mask |= NSWindowStyleMaskNonactivatingPanel;
+ 
+@@ -963,6 +974,7 @@ - (void) dealloc
+         [latentChildWindows release];
+         [latentParentWindow release];
+         [contentViewMaskLayer release];
++        [lastLeftMouseDown release];
+         [super dealloc];
+     }
+ 
+@@ -1016,7 +1028,7 @@ - (void) adjustFullScreenBehavior:(NSWindowCollectionBehavior)behavior
+         NSUInteger style = [self styleMask];
+ 
+         if (behavior & NSWindowCollectionBehaviorParticipatesInCycle &&
+-            style & NSWindowStyleMaskResizable && !(style & NSWindowStyleMaskUtilityWindow) && !maximized &&
++            style & NSWindowStyleMaskResizable && !(style & NSWindowStyleMaskUtilityWindow) && (!maximized || appDrawnFrame) &&
+             !(self.parentWindow || self.latentParentWindow))
+         {
+             behavior |= NSWindowCollectionBehaviorFullScreenPrimary;
+@@ -1041,7 +1053,7 @@ - (void) setWindowFeatures:(const struct macdrv_window_features*)wf
+     {
+         static const NSUInteger usedStyles = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable |
+                                              NSWindowStyleMaskResizable | NSWindowStyleMaskUtilityWindow | NSWindowStyleMaskBorderless |
+-                                             NSWindowStyleMaskNonactivatingPanel;
++                                             NSWindowStyleMaskNonactivatingPanel | NSWindowStyleMaskFullSizeContentView;
+         NSUInteger currentStyle = [self styleMask];
+         NSUInteger newStyle = style_mask_for_features(wf) | (currentStyle & ~usedStyles);
+ 
+@@ -1086,6 +1098,12 @@ - (void) setWindowFeatures:(const struct macdrv_window_features*)wf
+         }
+ 
+         resizable = wf->resizable;
++        appDrawnFrame = wf->app_drawn_frame;
++        self.titlebarAppearsTransparent = appDrawnFrame;
++        self.titleVisibility = appDrawnFrame ? NSWindowTitleHidden : NSWindowTitleVisible;
++        [[self standardWindowButton:NSWindowCloseButton] setHidden:appDrawnFrame];
++        [[self standardWindowButton:NSWindowMiniaturizeButton] setHidden:appDrawnFrame];
++        [[self standardWindowButton:NSWindowZoomButton] setHidden:appDrawnFrame];
+         [self adjustFeaturesForState];
+         [self setHasShadow:wf->shadow];
+     }
+@@ -2072,6 +2090,38 @@ - (void) updateForCursorClipping
+         [self adjustFeaturesForState];
+     }
+ 
++    /* Start Wine's manual window drag from the current mouse position, for windows
++     * that draw their own title bar and ask for a move with SC_MOVE (e.g. Inventor). */
++    - (void) startManualDrag
++    {
++        NSRect frame;
++        if (draggingPhase || !([NSEvent pressedMouseButtons] & 1)) return;
++        if (maximized)
++        {
++            /* dragging a maximized window un-maximizes it, keeping its frame (like Windows/macOS) */
++            macdrv_event* event;
++            NSRect content = [self contentRectForFrameRect:self.frame];
++            [[WineApplicationController sharedController] flipRect:&content];
++            event = macdrv_create_event(WINDOW_RESTORE_REQUESTED, self);
++            event->window_restore_requested.keep_frame = true;
++            event->window_restore_requested.frame = cgrect_win_from_mac(NSRectToCGRect(content));
++            [queue postEvent:event];
++            macdrv_release_event(event);
++        }
++        if (appDrawnFrame && lastLeftMouseDown)
++        {
++            /* native window drag: gives macOS edge snapping / tiling */
++            [self performWindowDragWithEvent:lastLeftMouseDown];
++            return;
++        }
++        if (![self isMovable]) return;
++        frame = self.frame;
++        dragStartPosition = [NSEvent mouseLocation];
++        dragWindowStartPosition = NSMakePoint(NSMinX(frame), NSMaxY(frame));
++        draggingPhase = 2;
++        [[WineApplicationController sharedController] window:self isBeingDragged:YES];
++    }
++
+     - (void) endWindowDragging
+     {
+         if (draggingPhase)
+@@ -2249,6 +2299,9 @@ - (NSRect) constrainFrameRect:(NSRect)frameRect toScreen:(NSScreen *)screen
+         // it.
+         NSArray* screens = [NSScreen screens];
+         NSRect contentRect = [self contentRectForFrameRect:frameRect];
++        /* App-drawn-frame windows are only titled for macOS window management; the app's
++         * own placement (e.g. maximized slightly past the work area) must not be fought. */
++        if (appDrawnFrame) return frameRect;
+         if (!screen_covered_by_rect(contentRect, screens) &&
+             frame_intersects_screens(frameRect, screens))
+             frameRect = [super constrainFrameRect:frameRect toScreen:screen];
+@@ -2328,6 +2381,11 @@ - (void) sendEvent:(NSEvent*)event
+             [[self firstResponder] keyDown:event];
+         else
+         {
++            if (type == NSEventTypeLeftMouseDown)
++            {
++                [lastLeftMouseDown release];
++                lastLeftMouseDown = [event retain];
++            }
+             if (!draggingPhase && maximized && ![self isMovable] &&
+                 ![self allowsMovingWithMaximized:YES] && [self allowsMovingWithMaximized:NO] &&
+                 type == NSEventTypeLeftMouseDown && (self.styleMask & NSWindowStyleMaskTitled))
+@@ -3960,3 +4018,41 @@ void macdrv_clear_ime_text(void)
+             [[window contentView] clearMarkedText];
+     });
+ }
++
++
++/***********************************************************************
++ *              macdrv_start_window_drag
++ */
++void macdrv_start_window_drag(WineWindow *window)
++{
++    OnMainThreadAsync(^{
++        [window startManualDrag];
++    });
++}
++
++/***********************************************************************
++ *              DXMT variants of the metal view functions
++ *
++ * newMetalViewWithDevice: returns the content view's single cached metal view,
++ * but DXMT creates a "new" view and releases the old one on every swapchain
++ * resize - which removed and freed the shared view (blank 3D view after a
++ * resize). These keep one reference per DXMT request and leave the view in place.
++ */
++WineMetalView *macdrv_dxmt_create_metal_view(WineContentView *view, id<MTLDevice> device)
++{
++    __block WineMetalView *metalView;
++
++    OnMainThread(^{
++        metalView = [view newMetalViewWithDevice:device];
++        [metalView retain];
++    });
++
++    return metalView;
++}
++
++void macdrv_dxmt_release_metal_view(WineMetalView *view)
++{
++    OnMainThread(^{
++        [view release];
++    });
++}
+diff --git a/b/dlls/winemac.drv/dxmt.c b/dlls/winemac.drv/dxmt.c
+new file mode 100644
+index 0000000..9d046be
+--- /dev/null
++++ b/dlls/winemac.drv/dxmt.c
+@@ -0,0 +1,163 @@
++/*
++ * Export for DXMT (Direct3D 11 -> Metal): "macdrv_functions".
++ *
++ * DXMT's winemetal.so dlsym()s this table and reads a macdrv_win_data with the
++ * old layout { hwnd, cocoa_window, cocoa_view, client_cocoa_view }. Wine 11's
++ * macdrv_win_data differs, so get_win_data here returns a shim with that layout
++ * whose client view is a Wine client surface's view (as used by Wine's own
++ * Vulkan/OpenGL), which also works for child windows and follows resizes.
++ */
++#if 0
++#pragma makedep unix
++#endif
++
++#include "config.h"
++#include <stdlib.h>
++#include <stdio.h>
++#include <pthread.h>
++#include "macdrv.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(macdrv);
++
++struct dxmt_win_data
++{
++    HWND hwnd;
++    void *cocoa_window;
++    void *cocoa_view;
++    void *client_cocoa_view;
++};
++
++struct dxmt_surface_entry { HWND hwnd; struct macdrv_client_surface *surface; };
++static struct dxmt_surface_entry dxmt_surfaces[64];
++static pthread_mutex_t dxmt_lock = PTHREAD_MUTEX_INITIALIZER;
++
++static struct macdrv_client_surface *dxmt_get_surface(HWND hwnd)
++{
++    struct macdrv_client_surface *surface = NULL;
++    struct macdrv_win_data *data;
++    struct client_surface *client;
++    int i, free_slot = -1;
++
++    pthread_mutex_lock(&dxmt_lock);
++    for (i = 0; i < 64; i++)
++    {
++        if (dxmt_surfaces[i].hwnd == hwnd) { surface = dxmt_surfaces[i].surface; break; }
++        if (!dxmt_surfaces[i].hwnd && free_slot < 0) free_slot = i;
++    }
++    /* reuse only while it is still the window's current client view */
++    if (surface && (data = get_win_data(hwnd)))
++    {
++        if (data->client_view != surface->cocoa_view) surface = NULL;
++        release_win_data(data);
++    }
++    if (!surface)
++    {
++        if (i < 64) dxmt_surfaces[i].hwnd = NULL;
++        if ((client = macdrv_CreateClientSurface(hwnd, 0, FALSE)))
++        {
++            surface = impl_from_client_surface(client);
++            if (i == 64) i = free_slot >= 0 ? free_slot : 0;
++            dxmt_surfaces[i].hwnd = hwnd;
++            dxmt_surfaces[i].surface = surface;
++        }
++    }
++    pthread_mutex_unlock(&dxmt_lock);
++    return surface;
++}
++
++
++/* Called from macdrv_WindowPosChanged: win32u only keeps client surfaces it
++ * "uses" in sync, so follow moves/resizes/visibility of DXMT's views here. */
++void dxmt_window_pos_changed(HWND hwnd)
++{
++    struct macdrv_client_surface *todo[64];
++    HWND todo_hwnd[64];
++    int i, n = 0;
++
++    pthread_mutex_lock(&dxmt_lock);
++    for (i = 0; i < 64; i++)
++    {
++        HWND h = dxmt_surfaces[i].hwnd;
++        if (!h) continue;
++        if (!NtUserIsWindow(h)) { dxmt_surfaces[i].hwnd = NULL; continue; }
++        while (h && h != hwnd) h = NtUserGetAncestor(h, GA_PARENT);
++        if (!h) continue;
++        todo[n] = dxmt_surfaces[i].surface;
++        todo_hwnd[n++] = dxmt_surfaces[i].hwnd;
++    }
++    pthread_mutex_unlock(&dxmt_lock);
++
++    for (i = 0; i < n; i++)
++    {
++        struct macdrv_client_surface *surface = todo[i];
++        BOOL visible;
++        if (!surface->client.hwnd || !surface->cocoa_view) continue;
++        visible = NtUserIsWindowVisible(todo_hwnd[i]);
++        if (visible) client_surface_present(&surface->client); /* refreshes rects -> view frame */
++        if (surface->client.hwnd) macdrv_set_view_hidden(surface->cocoa_view, !visible);
++        if (getenv("DXMT_SHIM_DEBUG"))
++            fprintf(stderr, "dxmt-shim: update %p (from %p) visible %d rect %s\n", todo_hwnd[i], hwnd, visible,
++                    wine_dbgstr_rect(&surface->client.monitor_rect));
++    }
++}
++
++static struct macdrv_win_data *dxmt_get_win_data(HWND hwnd)
++{
++    struct macdrv_client_surface *surface = dxmt_get_surface(hwnd);
++    struct dxmt_win_data *shim;
++    struct macdrv_win_data *data;
++
++    if (!surface) return NULL;
++    client_surface_present(&surface->client);
++    if (!(shim = calloc(1, sizeof(*shim)))) return NULL;
++    shim->hwnd = hwnd;
++    shim->cocoa_view = shim->client_cocoa_view = surface->cocoa_view;
++    if ((data = get_win_data(hwnd)))
++    {
++        shim->cocoa_window = data->cocoa_window;
++        release_win_data(data);
++    }
++    if (getenv("DXMT_SHIM_DEBUG"))
++        fprintf(stderr, "dxmt-shim: hwnd %p toplevel %p -> view %p window %p rect %s\n", hwnd, surface->client.toplevel,
++                shim->client_cocoa_view, shim->cocoa_window, wine_dbgstr_rect(&surface->client.monitor_rect));
++    TRACE("hwnd %p -> view %p\n", hwnd, shim->client_cocoa_view);
++    return (struct macdrv_win_data *)shim;
++}
++
++static void dxmt_release_win_data(struct macdrv_win_data *data)
++{
++    free(data);
++}
++
++static void *dxmt_get_cocoa_window(HWND hwnd, BOOL require_on_screen)
++{
++    return macdrv_get_cocoa_window(hwnd, require_on_screen);
++}
++
++struct macdrv_functions_t
++{
++    void (*macdrv_init_display_devices)(BOOL);
++    struct macdrv_win_data *(*get_win_data)(HWND hwnd);
++    void (*release_win_data)(struct macdrv_win_data *data);
++    void *(*macdrv_get_cocoa_window)(HWND hwnd, BOOL require_on_screen);
++    void *(*macdrv_create_metal_device)(void);
++    void (*macdrv_release_metal_device)(void *d);
++    void *(*macdrv_view_create_metal_view)(void *v, void *d);
++    void *(*macdrv_view_get_metal_layer)(void *v);
++    void (*macdrv_view_release_metal_view)(void *v);
++    void (*on_main_thread)(void *b);
++};
++
++__attribute__((visibility("default"))) struct macdrv_functions_t macdrv_functions =
++{
++    NULL,
++    dxmt_get_win_data,
++    dxmt_release_win_data,
++    dxmt_get_cocoa_window,
++    (void *)macdrv_create_metal_device,
++    (void *)macdrv_release_metal_device,
++    (void *)macdrv_dxmt_create_metal_view,
++    (void *)macdrv_view_get_metal_layer,
++    (void *)macdrv_dxmt_release_metal_view,
++    NULL,
++};
+diff --git a/dlls/winemac.drv/macdrv.h b/dlls/winemac.drv/macdrv.h
+index 89c498f..8c965ff 100644
+--- a/dlls/winemac.drv/macdrv.h
++++ b/dlls/winemac.drv/macdrv.h
+@@ -256,6 +256,7 @@ extern bool macdrv_client_surface_acquire_metal_swapchain(struct macdrv_client_s
+ 
+ extern struct macdrv_win_data *get_win_data(HWND hwnd);
+ extern void release_win_data(struct macdrv_win_data *data);
++extern void dxmt_window_pos_changed(HWND hwnd);
+ extern void init_win_context(void);
+ extern WineWindow *macdrv_get_cocoa_window(HWND hwnd, bool require_on_screen);
+ extern RGNDATA *get_region_data(HRGN hrgn, HDC hdc_lptodp);
+diff --git a/dlls/winemac.drv/macdrv_cocoa.h b/dlls/winemac.drv/macdrv_cocoa.h
+index 5157b38..dba7e3e 100644
+--- a/dlls/winemac.drv/macdrv_cocoa.h
++++ b/dlls/winemac.drv/macdrv_cocoa.h
+@@ -103,6 +103,8 @@ struct macdrv_query;
+ /* main */
+ extern int topmost_float_inactive;
+ extern bool capture_displays_for_fullscreen;
++extern unsigned short macdrv_app_name[128];
++extern int macdrv_app_name_len;
+ extern bool left_option_is_alt;
+ extern bool right_option_is_alt;
+ extern bool left_command_is_ctrl;
+@@ -452,6 +454,7 @@ struct macdrv_window_features {
+     unsigned int    utility:1;
+     unsigned int    shadow:1;
+     unsigned int    prevents_app_activation:1;
++    unsigned int    app_drawn_frame:1;
+ };
+ 
+ struct macdrv_window_state {
+@@ -482,6 +485,7 @@ extern void macdrv_order_cocoa_window(WineWindow *window, WineWindow *prev,
+ extern void macdrv_hide_cocoa_window(WineWindow *window);
+ extern void macdrv_set_cocoa_window_frame(WineWindow *window, const CGRect* new_frame);
+ extern void macdrv_get_cocoa_window_frame(WineWindow *window, CGRect* out_frame);
++extern void macdrv_start_window_drag(WineWindow *window);
+ extern void macdrv_set_cocoa_parent_window(WineWindow *window, WineWindow *parent);
+ extern void macdrv_window_set_color_image(WineWindow *window, CGImageRef image, CGRect rect, CGRect dirty);
+ extern void macdrv_window_set_shape_image(WineWindow *window, CGImageRef image);
+@@ -503,6 +507,8 @@ extern void macdrv_release_metal_device(MTLDevice_id device);
+ extern WineMetalView *macdrv_view_create_metal_view(WineContentView *view, MTLDevice_id device);
+ extern CAMetalLayer *macdrv_view_get_metal_layer(WineMetalView *view);
+ extern void macdrv_view_release_metal_view(WineMetalView *view);
++extern WineMetalView *macdrv_dxmt_create_metal_view(WineContentView *view, MTLDevice_id device);
++extern void macdrv_dxmt_release_metal_view(WineMetalView *view);
+ extern WineMetalSwapChain_id macdrv_create_view_swapchain(WineContentView *view);
+ extern WineMetalSwapChain_id macdrv_create_offscreen_swapchain(void* hwnd, CGRect bounds);
+ extern CAMetalLayer *macdrv_swapchain_get_layer(WineMetalSwapChain_id swapchain);
+diff --git a/dlls/winemac.drv/macdrv_main.c b/dlls/winemac.drv/macdrv_main.c
+index cc3d3b3..cabf5c2 100644
+--- a/dlls/winemac.drv/macdrv_main.c
++++ b/dlls/winemac.drv/macdrv_main.c
+@@ -52,6 +52,8 @@ bool cursor_clipping_locks_windows = true;
+ bool use_precise_scrolling = true;
+ int gl_surface_mode = GL_SURFACE_IN_FRONT_OPAQUE;
+ bool retina_enabled = false;
++unsigned short macdrv_app_name[128];
++int macdrv_app_name_len;
+ bool enable_app_nap = false;
+ 
+ pthread_key_t macdrv_thread_data_key = 0;
+@@ -295,6 +297,22 @@ static void setup_options(void)
+         }
+     }
+ 
++    /* Name shown in the menu bar, Dock and app switcher instead of "wine":
++     * AppName setting, else the program's file name without ".exe". */
++    if (!get_config_key(hkey, appkey, "AppName", buffer, sizeof(buffer)) && buffer[0])
++    {
++        for (len = 0; buffer[len] && len < ARRAY_SIZE(macdrv_app_name); len++) macdrv_app_name[len] = buffer[len];
++        macdrv_app_name_len = len;
++    }
++    else if ((len = lstrlenW(appname)))
++    {
++        if (len > 4 && appname[len - 4] == '.' && (appname[len - 3] | 0x20) == 'e' &&
++            (appname[len - 2] | 0x20) == 'x' && (appname[len - 1] | 0x20) == 'e') len -= 4;
++        if (len > ARRAY_SIZE(macdrv_app_name)) len = ARRAY_SIZE(macdrv_app_name);
++        memcpy(macdrv_app_name, appname, len * sizeof(WCHAR));
++        macdrv_app_name_len = len;
++    }
++
+     if (!get_config_key(hkey, appkey, "WindowsFloatWhenInactive", buffer, sizeof(buffer)))
+     {
+         static const WCHAR noneW[] = {'n','o','n','e',0};
+diff --git a/dlls/winemac.drv/surface.c b/dlls/winemac.drv/surface.c
+index 5552b82..1404e2b 100644
+--- a/dlls/winemac.drv/surface.c
++++ b/dlls/winemac.drv/surface.c
+@@ -25,6 +25,8 @@
+ #endif
+ 
+ #include "config.h"
++#include <stdio.h>
++#include <stdlib.h>
+ #include "macdrv.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(bitblt);
+@@ -84,6 +86,48 @@ static BOOL macdrv_surface_flush(struct window_surface *window_surface, const RE
+     CGColorSpaceRef colorspace;
+     CGImageRef image;
+     struct macdrv_win_data *data;
++    RECT dirty_ext = *dirty;
++
++    /* Windows that draw their own frame (e.g. Inventor) inset their client area by
++     * an unpainted border when maximized; on Windows it is off-screen, on macOS the
++     * top strip shows under the menu bar as a white line. Extend the client's edge
++     * pixels over it. */
++    if ((data = get_win_data(window_surface->hwnd)))
++    {
++        DWORD style = NtUserGetWindowLongW(window_surface->hwnd, GWL_STYLE);
++        RECT c = data->rects.client;
++        int w = min(color_info->bmiHeader.biWidth, data->rects.visible.right - data->rects.visible.left - rect->left);
++        int h = min(abs(color_info->bmiHeader.biHeight), data->rects.visible.bottom - data->rects.visible.top - rect->top);
++        BOOL edge = (style & WS_MAXIMIZE) && (style & WS_THICKFRAME) && (style & WS_CAPTION) == WS_CAPTION &&
++                    EqualRect(&data->rects.window, &data->rects.visible) && color_info->bmiHeader.biHeight < 0;
++        OffsetRect(&c, -data->rects.visible.left - rect->left, -data->rects.visible.top - rect->top);
++        release_win_data(data);
++        if (getenv("DXMT_SHIM_DEBUG") && (style & WS_MAXIMIZE))
++        {
++            static HWND last; if (last != window_surface->hwnd) { last = window_surface->hwnd;
++            fprintf(stderr, "edge-fill: %p edge %d rect %s client %s w %d h %d bh %d\n", window_surface->hwnd, edge,
++                    wine_dbgstr_rect(rect), wine_dbgstr_rect(&c), w, h, (int)color_info->bmiHeader.biHeight); }
++        }
++        if (edge && c.left >= 0 && c.top >= 0 && c.right <= w && c.bottom <= h && c.left < 16 && c.top < 16 &&
++            w - c.right < 16 && h - c.bottom < 16 && c.right > c.left && c.bottom > c.top)
++        {
++            int stride = color_info->bmiHeader.biSizeImage / abs(color_info->bmiHeader.biHeight), x, y;
++            BYTE *bits = (BYTE *)color_bits;
++            for (y = c.top; y < c.bottom; y++)
++            {
++                DWORD *row = (DWORD *)(bits + y * stride);
++                for (x = 0; x < c.left; x++) row[x] = row[c.left];
++                for (x = c.right; x < w; x++) row[x] = row[c.right - 1];
++            }
++            for (y = 0; y < c.top; y++) memcpy(bits + y * stride, bits + c.top * stride, w * 4);
++            for (y = c.bottom; y < h; y++) memcpy(bits + y * stride, bits + (c.bottom - 1) * stride, w * 4);
++            /* push the border along with any change touching the client edges */
++            if (dirty_ext.top <= c.top) dirty_ext.top = 0;
++            if (dirty_ext.left <= c.left) dirty_ext.left = 0;
++            if (dirty_ext.bottom >= c.bottom) dirty_ext.bottom = h;
++            if (dirty_ext.right >= c.right) dirty_ext.right = w;
++        }
++    }
+ 
+     colorspace = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+     image = CGImageCreate(color_info->bmiHeader.biWidth, abs(color_info->bmiHeader.biHeight), 8, 32,
+@@ -91,7 +135,7 @@ static BOOL macdrv_surface_flush(struct window_surface *window_surface, const RE
+                           alpha_info | kCGBitmapByteOrder32Little, surface->provider, NULL, retina_on, kCGRenderingIntentDefault);
+     CGColorSpaceRelease(colorspace);
+ 
+-    macdrv_window_set_color_image(surface->window, image, cgrect_from_rect(*rect), cgrect_from_rect(*dirty));
++    macdrv_window_set_color_image(surface->window, image, cgrect_from_rect(*rect), cgrect_from_rect(dirty_ext));
+     CGImageRelease(image);
+ 
+     if (shape_changed)
+diff --git a/dlls/winemac.drv/window.c b/dlls/winemac.drv/window.c
+index 552971f..18a8ec2 100644
+--- a/dlls/winemac.drv/window.c
++++ b/dlls/winemac.drv/window.c
+@@ -26,6 +26,8 @@
+ #endif
+ 
+ #include "config.h"
++#include <stdio.h>
++#include <stdlib.h>
+ #include "macdrv.h"
+ 
+ #include <IOKit/pwr_mgt/IOPMLib.h>
+@@ -86,7 +88,22 @@ static struct macdrv_window_features get_cocoa_window_features(struct macdrv_win
+     struct macdrv_window_features wf = {0};
+ 
+     if (ex_style & WS_EX_NOACTIVATE) wf.prevents_app_activation = TRUE;
+-    if (EqualRect(&data->rects.window, &data->rects.visible)) return wf;
++    if (EqualRect(&data->rects.window, &data->rects.visible))
++    {
++        /* Window draws its own frame (e.g. Inventor): keep it borderless but let
++         * macOS resize it from the edges, since it reports no resize borders. */
++        if ((style & WS_THICKFRAME) && (style & WS_CAPTION) == WS_CAPTION && !(style & WS_CHILD) &&
++            !(ex_style & (WS_EX_TOOLWINDOW | WS_EX_LAYERED)))
++        {
++            /* native macOS window (tiling, full screen) with a hidden, transparent title bar */
++            wf.app_drawn_frame = TRUE;
++            wf.resizable = TRUE;
++            wf.shadow = TRUE;
++            if (style & WS_MINIMIZEBOX) wf.minimize_button = TRUE;
++            if (style & WS_MAXIMIZEBOX) wf.maximize_button = TRUE;
++        }
++        return wf;
++    }
+ 
+     return get_window_features_for_style(style, ex_style, data->shaped);
+ }
+@@ -858,7 +875,9 @@ static LRESULT move_window(HWND hwnd, WPARAM wparam)
+     MONITORINFO info;
+ 
+     if ((style & (WS_MINIMIZE | WS_MAXIMIZE)) || !IsWindowVisible(hwnd)) return -1;
+-    if (hittest && hittest != HTCAPTION) return -1;
++    /* Windows treats any non-zero low nibble of SC_MOVE as a mouse-initiated move
++     * (apps send SC_MOVE|HTCLIENT = 0xF011 from custom title bars, e.g. Inventor). */
++    if (hittest >= HTLEFT && hittest <= HTBOTTOMRIGHT) return -1;
+ 
+     capturePoint.x = (short)LOWORD(dwPoint);
+     capturePoint.y = (short)HIWORD(dwPoint);
+@@ -1480,6 +1499,13 @@ LRESULT macdrv_SysCommand(HWND hwnd, WPARAM wparam, LPARAM lparam, const POINT *
+     WPARAM command = wparam & 0xfff0;
+ 
+     TRACE("%p, %x, %lx\n", hwnd, (unsigned)wparam, lparam);
++    if (getenv("DXMT_SHIM_DEBUG"))
++    {
++        struct macdrv_win_data *d = get_win_data(hwnd);
++        fprintf(stderr, "macdrv-syscmd: %p %x lp %lx style %x data %p cocoa %p on_screen %d\n", hwnd, (unsigned)wparam, lparam,
++                (unsigned)NtUserGetWindowLongW(hwnd, GWL_STYLE), d, d ? d->cocoa_window : NULL, d ? d->on_screen : -1);
++        if (d) release_win_data(d);
++    }
+ 
+     if (!(data = get_win_data(hwnd))) goto done;
+     if (!data->cocoa_window || !data->on_screen) goto done;
+@@ -1496,6 +1522,15 @@ LRESULT macdrv_SysCommand(HWND hwnd, WPARAM wparam, LPARAM lparam, const POINT *
+ 
+     if (command == SC_MOVE)
+     {
++        /* Borderless window with an app-drawn title bar asking for a mouse move:
++         * let Cocoa track the drag (Wine's modal loop gets no mouse moves here). */
++        if ((wparam & 0x0f) && EqualRect(&data->rects.window, &data->rects.visible) &&
++            !(NtUserGetWindowLongW(hwnd, GWL_STYLE) & WS_MINIMIZE))
++        {
++            macdrv_start_window_drag(data->cocoa_window);
++            release_win_data(data);
++            return 0;
++        }
+         release_win_data(data);
+         return move_window(hwnd, wparam);
+     }
+@@ -1638,7 +1673,7 @@ void macdrv_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UINT
+     unsigned int new_style = NtUserGetWindowLongW(hwnd, GWL_STYLE);
+     struct window_rects old_rects;
+ 
+-    if (!(data = get_win_data(hwnd))) return;
++    if (!(data = get_win_data(hwnd))) { dxmt_window_pos_changed(hwnd); return; }
+ 
+     thread_data = macdrv_thread_data();
+ 
+@@ -1690,6 +1725,7 @@ void macdrv_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UINT
+ 
+ done:
+     release_win_data(data);
++    dxmt_window_pos_changed(hwnd);
+ }
+ 
+ 

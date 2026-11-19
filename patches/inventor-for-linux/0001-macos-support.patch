@@ -1,0 +1,107 @@
+diff --git a/mac-env.sh b/mac-env.sh
+new file mode 100644
+index 0000000..2b00794
+--- /dev/null
++++ b/mac-env.sh
+@@ -0,0 +1,14 @@
++# Source this before running any script of this project on macOS.
++B=/opt/homebrew
++export PATH="$B/opt/coreutils/libexec/gnubin:$B/opt/gnu-sed/libexec/gnubin:$B/opt/findutils/libexec/gnubin:$B/opt/grep/libexec/gnubin:$B/opt/gawk/libexec/gnubin:$B/opt/util-linux/bin:$B/opt/gnu-getopt/bin:$B/bin:$PATH"
++export INV_DISTRO=arch
++export INV_WINE=bundled
++export INV_WINE_HOME="$HOME/inventor-mac/wine"
++export INV_DXVK=dxmt
++export DXMT_DIR="$HOME/inventor-mac/dl/dxmt/v0.80"
++export INV_VKD3D=off
++export INV_YEAR=2027
++export INV_FONT_DIRS_MAC=1
++# Wine on macOS: Rosetta, no esync/msync surprises, Retina
++export WINEDEBUG="${WINEDEBUG:--all}"
++export WINEESYNC=0
+diff --git a/scripts/install-from-image.py b/scripts/install-from-image.py
+index 8ee39d1..7649f8f 100755
+--- a/scripts/install-from-image.py
++++ b/scripts/install-from-image.py
+@@ -1300,7 +1300,16 @@ class Installer:
+         """Windows image names (lower case) of the processes running in this
+         prefix, from /proc: WINEPREFIX in their environment, the Windows
+         path as the first word of their command line."""
+-        names, want = [], ("WINEPREFIX=" + self.prefix).encode()
++        names = []
++        if not os.path.isdir("/proc"):
++            # macOS: Wine sets each process's argv to its Windows command line
++            out = subprocess.run(["ps", "-axww", "-o", "command="], capture_output=True, text=True).stdout
++            for line in out.splitlines():
++                m = re.match(r'\s*"?([A-Za-z]:\\[^"]*?\.exe)', line, re.I)
++                if m:
++                    names.append(m.group(1).rsplit("\\", 1)[-1].lower())
++            return names
++        want = ("WINEPREFIX=" + self.prefix).encode()
+         for pid in os.listdir("/proc"):
+             if not pid.isdigit():
+                 continue
+diff --git a/scripts/lib/common.sh b/scripts/lib/common.sh
+index da24e27..c0f457d 100644
+--- a/scripts/lib/common.sh
++++ b/scripts/lib/common.sh
+@@ -197,7 +197,7 @@ fi
+ [ -d "${WINE_DATA_DIR:-}" ] || WINE_DATA_DIR=/usr/share/wine
+ unset _wine_bin
+ if [ -z "${INV_FONT_DIRS+x}" ]; then
+-    INV_FONT_DIRS=(/usr/share/fonts /usr/local/share/fonts "$HOME/.local/share/fonts" "$HOME/.fonts" "$WINE_DATA_DIR")
++    INV_FONT_DIRS=(/usr/share/fonts /usr/local/share/fonts "$HOME/.local/share/fonts" "$HOME/.fonts" "$HOME/Library/Fonts" /System/Library/Fonts /Library/Fonts "$WINE_DATA_DIR")
+ fi
+ INV_FONT_LETTERS=(t u v w x)
+ 
+@@ -648,6 +648,32 @@ install_dxvk() {
+         info "DXVK not installed in the prefix (INV_DXVK=none)"
+         return 0
+     fi
++    if [ "$INV_DXVK" = dxmt ]; then
++        # macOS: DXMT (Direct3D 11 -> Metal). Its DLLs are Wine builtins: they
++        # replace Wine's d3d11/dxgi/d3d10core in the Wine runtime itself (done
++        # when the runtime is assembled; originals in lib/wine/wined3d-backup)
++        # and are copied into system32/syswow64. Wine refuses them as "native".
++        local src="${DXMT_DIR:?DXMT_DIR not set}"
++        # winemetal stays a Wine builtin (it has a unix side). d3d11/dxgi/d3d10core
++        # go in as *native* DLLs (builtin marker at 0x40 blanked) so Wine's own
++        # wined3d stays the builtin - msedgewebview2.exe (AppDefaults=builtin) needs it.
++        local a sys
++        for a in x86_64 i386; do
++            sys=system32; [ $a = i386 ] && sys=syswow64
++            [ -d "$P_C/windows/$sys" ] || continue
++            cp "$src/$a-windows/winemetal.dll" "$P_C/windows/$sys/"
++            for d in dxgi d3d11 d3d10core; do
++                cp "$src/$a-windows/$d.dll" "$P_C/windows/$sys/$d.dll"
++                printf '\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0' | dd of="$P_C/windows/$sys/$d.dll" bs=1 seek=64 conv=notrunc 2>/dev/null
++            done
++        done
++        for d in dxgi d3d11 d3d10core; do
++            wine_reg_add 'HKCU\Software\Wine\DllOverrides' /v "$d" /t REG_SZ /d native
++        done
++        wine_reg_add 'HKCU\Software\Wine\DllOverrides' /v d3dcompiler_47 /t REG_SZ /d native
++        ok "DXMT from $src"
++        return 0
++    fi
+     if [ "$INV_DXVK" = system ]; then
+         command -v setup_dxvk >/dev/null || die "INV_DXVK=system but setup_dxvk is not installed"
+         setup_dxvk install >>"$LOGDIR/setup-wine.log" 2>&1
+diff --git a/scripts/lib/configure.sh b/scripts/lib/configure.sh
+index 04e516e..99f18dc 100644
+--- a/scripts/lib/configure.sh
++++ b/scripts/lib/configure.sh
+@@ -6,7 +6,13 @@
+ # Wine's native Wayland driver is not usable for Inventor yet (menus).
+ cfg_wine_mode() {
+     wine_reg_add 'HKCU\Software\Wine' /v Version /t REG_SZ /d win10
+-    wine_reg_add 'HKCU\Software\Wine\Drivers' /v Graphics /t REG_SZ /d x11
++    wine_reg_add 'HKCU\Software\Wine\Drivers' /v Graphics /t REG_SZ /d mac
++    # Retina: draw at native resolution, Windows scaling to match (INV_DPI, default 192 = 200%)
++    wine_reg_add 'HKCU\Software\Wine\Mac Driver' /v RetinaMode /t REG_SZ /d y
++    # macOS menu bar / Dock name (patched winemac.drv; default is the .exe name)
++    wine_reg_add 'HKCU\Software\Wine\AppDefaults\Inventor.exe\Mac Driver' /v AppName /t REG_SZ /d 'Autodesk Inventor'
++    wine_reg_add 'HKCU\Control Panel\Desktop' /v LogPixels /t REG_DWORD /d "${INV_DPI:-192}"
++    wine_reg_add 'HKLM\System\CurrentControlSet\Hardware Profiles\Current\Software\Fonts' /v LogPixels /t REG_DWORD /d "${INV_DPI:-192}"
+ }
+ 
+ # The Licensing Agent needs Identity Manager's IdSDK SSO plugin next to it.
