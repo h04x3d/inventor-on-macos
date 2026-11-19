@@ -20,7 +20,7 @@ Mac app.
 | | |
 |---|---|
 | ![Retina-sharp ribbon](screenshots/retina-ribbon.png) | ![Menu bar shows "Autodesk Inventor"](screenshots/menu-bar-app-name.png) |
-| Full Retina resolution with 200 % Windows scaling | Real app name in the menu bar, Dock and app switcher |
+| Full Retina resolution with 200 % Windows scaling | |
 
 ## Status
 
