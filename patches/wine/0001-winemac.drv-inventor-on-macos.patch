@@ -544,10 +544,10 @@ index bbd528d..81aff2e 100644
 +}
 diff --git a/b/dlls/winemac.drv/dxmt.c b/dlls/winemac.drv/dxmt.c
 new file mode 100644
-index 0000000..9d046be
+index 0000000..6f3f1db
 --- /dev/null
 +++ b/dlls/winemac.drv/dxmt.c
-@@ -0,0 +1,163 @@
+@@ -0,0 +1,191 @@
 +/*
 + * Export for DXMT (Direct3D 11 -> Metal): "macdrv_functions".
 + *
@@ -616,12 +616,41 @@ index 0000000..9d046be
 +}
 +
 +
++/* Is the view's window actually on top? Windows hides covered child windows by
++ * clipping, but a Metal layer ignores the Win32 z-order - e.g. the inactive tabs
++ * of an MDI app (maximized MDI children are all "visible", stacked). So treat a
++ * window as hidden when a higher sibling covers its centre, at any level up to
++ * the top-level window. */
++static BOOL dxmt_view_visible(HWND hwnd)
++{
++    HWND node = hwnd, parent, sib, desktop = NtUserGetDesktopWindow();
++    UINT dpi = NtUserGetDpiForWindow(hwnd);
++
++    if (!NtUserIsWindowVisible(hwnd)) return FALSE;
++    while ((parent = NtUserGetAncestor(node, GA_PARENT)) && parent != desktop)
++    {
++        RECT r, rs;
++        POINT c;
++        if (!NtUserGetWindowRect(node, &r, dpi)) break;
++        c.x = (r.left + r.right) / 2; c.y = (r.top + r.bottom) / 2;
++        for (sib = NtUserGetWindowRelative(node, GW_HWNDPREV); sib; sib = NtUserGetWindowRelative(sib, GW_HWNDPREV))
++        {
++            if (!(NtUserGetWindowLongW(sib, GWL_STYLE) & WS_VISIBLE)) continue;
++            if (NtUserGetWindowRect(sib, &rs, dpi) && c.x >= rs.left && c.x < rs.right && c.y >= rs.top && c.y < rs.bottom)
++                return FALSE;
++        }
++        node = parent;
++    }
++    return TRUE;
++}
++
 +/* Called from macdrv_WindowPosChanged: win32u only keeps client surfaces it
-+ * "uses" in sync, so follow moves/resizes/visibility of DXMT's views here. */
++ * "uses" in sync, so follow moves/resizes/visibility/z-order of DXMT's views
++ * here - for every view inside the same top-level window. */
 +void dxmt_window_pos_changed(HWND hwnd)
 +{
 +    struct macdrv_client_surface *todo[64];
-+    HWND todo_hwnd[64];
++    HWND todo_hwnd[64], top = NtUserGetAncestor(hwnd, GA_ROOT);
 +    int i, n = 0;
 +
 +    pthread_mutex_lock(&dxmt_lock);
@@ -630,10 +659,9 @@ index 0000000..9d046be
 +        HWND h = dxmt_surfaces[i].hwnd;
 +        if (!h) continue;
 +        if (!NtUserIsWindow(h)) { dxmt_surfaces[i].hwnd = NULL; continue; }
-+        while (h && h != hwnd) h = NtUserGetAncestor(h, GA_PARENT);
-+        if (!h) continue;
++        if (NtUserGetAncestor(h, GA_ROOT) != top) continue;
 +        todo[n] = dxmt_surfaces[i].surface;
-+        todo_hwnd[n++] = dxmt_surfaces[i].hwnd;
++        todo_hwnd[n++] = h;
 +    }
 +    pthread_mutex_unlock(&dxmt_lock);
 +
@@ -642,7 +670,7 @@ index 0000000..9d046be
 +        struct macdrv_client_surface *surface = todo[i];
 +        BOOL visible;
 +        if (!surface->client.hwnd || !surface->cocoa_view) continue;
-+        visible = NtUserIsWindowVisible(todo_hwnd[i]);
++        visible = dxmt_view_visible(todo_hwnd[i]);
 +        if (visible) client_surface_present(&surface->client); /* refreshes rects -> view frame */
 +        if (surface->client.hwnd) macdrv_set_view_hidden(surface->cocoa_view, !visible);
 +        if (getenv("DXMT_SHIM_DEBUG"))
