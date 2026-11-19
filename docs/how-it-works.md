@@ -48,6 +48,9 @@ run unchanged apart from a small patch, with GNU coreutils/sed/grep/... first on
   registers fonts as `\??\unix\...` paths, which WPF can't turn into a URI:
   Inventor crashed building its ribbon (`UriFormatException` in
   `GlyphTypeface`).
+* **Product key** – ODIS passes the product key to each MSI; the Linux tool left
+  it out. Inventor didn't mind, Inventor CAM's licensing step fails without it
+  ("Default product key cannot be empty"), so the image's default key is passed.
 * **Process detection** – the installer looked at `/proc`; on macOS it uses `ps`.
 * **App name** – `AppName=Autodesk Inventor` for `Inventor.exe` (see below).
 

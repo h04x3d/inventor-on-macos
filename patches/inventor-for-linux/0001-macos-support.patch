@@ -19,10 +19,25 @@ index 0000000..2b00794
 +export WINEDEBUG="${WINEDEBUG:--all}"
 +export WINEESYNC=0
 diff --git a/scripts/install-from-image.py b/scripts/install-from-image.py
-index 8ee39d1..7649f8f 100755
+index 8ee39d1..5f4d512 100755
 --- a/scripts/install-from-image.py
 +++ b/scripts/install-from-image.py
-@@ -1300,7 +1300,16 @@ class Installer:
+@@ -531,7 +531,14 @@ class Installer:
+         argv.append("ADSK_ODIS_SETUP=1")
+         dropped, options = [], []
+         own = {k.lower() for k in (s.get("properties") or {})}
++        # the product key: ODIS passes the key chosen in its dialog, i.e. the
++        # image's default when nobody types one - Inventor CAM's licensing
++        # custom action fails with "Default product key cannot be empty" otherwise
++        prodkey = self.vars.get("adlm_def_prodkey")
+         for k, v in s["msiProperties"].items():
++            if prodkey and k.upper() in ("ADLM_PRODKEY", "ADLM_DEF_PRODKEY"):
++                argv.append("%s=%s" % (k, prodkey))
++                continue
+             # a value that is one of the image's setup options (DC_GOST,
+             # STANDALONE_LP from setup.xml): Windows' command lines show that
+             # ODIS does not pass such properties (2026-11-16, run 3)
+@@ -1300,7 +1307,16 @@ class Installer:
          """Windows image names (lower case) of the processes running in this
          prefix, from /proc: WINEPREFIX in their environment, the Windows
          path as the first word of their command line."""

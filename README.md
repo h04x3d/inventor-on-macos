@@ -30,6 +30,8 @@ Mac app.
 | Autodesk sign-in and licensing (browser sign-in, see below) | ✅ |
 | Part modelling, 3D viewport through Metal (DXMT) | ✅ |
 | Inventor COM/.NET API (see [examples](examples/automation)) | ✅ |
+| Design tab generators (bolted connection, shaft, …), Content Center libraries | ✅ |
+| Inventor CAM 2027 add-in (`scripts/60-install-cam.sh`) | ✅ installs and loads |
 | Native macOS windows: Retina, app name, resize, drag | ✅ |
 | Native macOS Open / Save / folder panels | ✅ |
 | macOS tiling, full screen and Split View | ✅ |
@@ -38,7 +40,7 @@ Mac app.
 |---|---|
 | WebView2 panes (Home tab, licence dialog) are blank – macOS can't show another process's child window. Sign in with `scripts/sign-in.sh`; use *File → New/Open* instead of Home | ⚠️ |
 | Runs under Rosetta 2 (x86_64), so heavy assemblies are slower than on a PC | ⚠️ |
-| Inventor CAM, Nastran, Vault, assemblies and drawings at scale: not tested yet | ❔ |
+| CAM toolpath generation/simulation, Nastran, Vault, drawings at scale: not tested yet | ❔ |
 
 ## Requirements
 
@@ -77,6 +79,8 @@ It starts Inventor and presses *Sign in with your Autodesk ID* in the
 (invisible) licence dialog. Finish signing in in your browser and click
 **Open Product**. After that, start Inventor from **Autodesk Inventor 2027** in
 `~/Applications`, or open `.ipt`/`.iam`/`.idw` files with it.
+
+Optional – Inventor CAM: quit Inventor, then `scripts/60-install-cam.sh ~/Downloads/INHSMP_2027_NA_win_db.sfx.exe`.
 
 Keep your files in `~/Inventor` – Inventor sees it as drive `D:`. The prefix is
 sandboxed and can't see the rest of your Mac.

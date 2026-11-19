@@ -18,6 +18,7 @@ plus the Linux project's install logs), Inventor's own logs under
 | Fuzzy UI | Retina mode: `HKCU\Software\Wine\Mac Driver\RetinaMode=y` and `LogPixels=192`; change `INV_DPI` (e.g. 168 = 175 %) for more room |
 | A Save/Open panel refuses a folder | the Windows side only sees `C:` and `~/Inventor` (`D:`); save inside `~/Inventor` |
 | Want Wine's own file dialogs back | `HKCU\Software\Wine\Mac Driver` → `NativeFileDialogs` = `n` |
+| "Could not find file ...\\Design Data\\XLS\\en-US\\Thread.xlsx" in an old Pack and Go project | the pack carries pre-2020 `thread.xls`; copy `thread.xlsx`/`clearance.xlsx` from `C:\\Users\\Public\\Documents\\Autodesk\\Inventor 2027\\Design Data\\XLS\\en-US` into it, or use the Default project |
 | `wineserver: sock_get_ntstatus() can't map error: Host is down` | harmless network probing noise |
 
 Useful while debugging: `tools/` has tiny Win32 programs (build with `make -C
