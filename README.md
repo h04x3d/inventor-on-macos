@@ -31,7 +31,7 @@ Mac app.
 | Part modelling, 3D viewport through Metal (DXMT) | ✅ |
 | Inventor COM/.NET API (see [examples](examples/automation)) | ✅ |
 | Native macOS windows: Retina, app name, resize, drag | ✅ |
-| macOS tiling / full screen / Split View | implemented, still being verified |
+| macOS tiling, full screen and Split View | ✅ |
 
 | Known limitations | |
 |---|---|
