@@ -50,7 +50,7 @@ Mac app.
 ## Install
 
 ```sh
-git clone https://github.com/<you>/inventor-on-macos.git
+git clone https://github.com/h04x3d/inventor-on-macos.git
 cd inventor-on-macos
 ./install.sh ~/Downloads/inventor-2027-offline     # folder with the two installer files
 ```
